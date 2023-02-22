@@ -498,11 +498,28 @@ class ThreadSafeMallocTaskAllocator
   absl::Mutex mu_;
   using Parent = SingleThreadMallocTaskAllocator<TaskType>;
 };
-
+# define liudelong_test
 template <typename TaskType>
 void BasicDispatchScheduler<TaskType>::DispatchMessage(const Message& msg) {
+  #ifdef liudelong_test
+  static int first=1;
+  static auto begin=absl::Now();
+  int64_t now;
+  if(first)
+  {
+    now=0;
+  }
+  else
+  {
+    now=ToInt64Nanoseconds(absl::Now()-begin);
+  }
+  std::cout<<msg.stringify();
+  if(msg.type==MSG_TASK_BLOCKED)
+  {
+    auto payload=static_cast<const ghost_msg_payload_task_blocked*>(msg.payload());
+  }
   if (msg.type() == MSG_NOP) return;
-
+  #endif
   // CPU messages.
   if (msg.is_cpu_msg()) {
     switch (msg.type()) {
