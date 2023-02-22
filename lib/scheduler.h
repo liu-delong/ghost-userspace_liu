@@ -502,21 +502,45 @@ class ThreadSafeMallocTaskAllocator
 template <typename TaskType>
 void BasicDispatchScheduler<TaskType>::DispatchMessage(const Message& msg) {
   #ifdef liudelong_test
+  #define gtids_size 10
   static int first=1;
   static auto begin=absl::Now();
   int64_t now;
+  static uint64_t gtids[gtids_size]={0,0,0};
+  static int run_times[gtids_size]={0,0,0,0,0};
+  int gtid_index=0;
   if(first)
   {
     now=0;
+    first=0;
   }
   else
   {
     now=ToInt64Nanoseconds(absl::Now()-begin);
   }
   std::cout<<msg.stringify();
-  if(msg.type==MSG_TASK_BLOCKED)
+  if(msg.type()==MSG_TASK_BLOCKED)
   {
     auto payload=static_cast<const ghost_msg_payload_task_blocked*>(msg.payload());
+    for(gtid_index=0;gtid_index<gtids_size;gtid_index++)
+    {
+      if(gtids[gtid_index]==0)
+      {
+        gtids[gtid_index]=payload->gtid;
+      }
+      if(gtids[gtid_index]==payload->gtid)
+      {
+        break;
+      }
+    }
+    int64_t this_time_run_time=payload->runtime-run_times[gtid_index];
+    run_times[gtid_index]=payload->runtime;
+    //std::cout<<"["<<gtid_index<<" "<<run_times[gtid_index]<<"]"<<std::endl;
+    std::cout<<" "<<now-this_time_run_time<<" "<<now<<" "<<this_time_run_time<<std::endl;
+  }
+  else
+  {
+    std::cout<<std::endl;
   }
   if (msg.type() == MSG_NOP) return;
   #endif
