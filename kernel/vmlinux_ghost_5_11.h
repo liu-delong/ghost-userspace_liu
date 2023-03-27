@@ -8790,6 +8790,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_SK_LOOKUP = 30,
 	BPF_PROG_TYPE_GHOST_SCHED = 1000,
 	BPF_PROG_TYPE_GHOST_MSG = 1001,
+	BPF_PROG_TYPE_GHOST_SELECT_RQ = 1002,
 };
 
 enum bpf_attach_type {
@@ -8832,6 +8833,13 @@ enum bpf_attach_type {
 	BPF_SK_LOOKUP = 36,
 	BPF_XDP = 37,
 	__MAX_BPF_ATTACH_TYPE = 38,
+};
+
+enum {
+	BPF_GHOST_SCHED_PNT = 2000,
+	BPF_GHOST_MSG_SEND = 2001,
+	BPF_GHOST_SELECT_RQ = 2002,
+	__MAX_BPF_GHOST_ATTACH_TYPE = 2003,
 };
 
 struct sock_filter {
@@ -32763,6 +32771,12 @@ struct gf_dirent {
  * ghost ABI structs were all in this block of non-relocatable structs.
  *
  * Anytime we regenerate vmlinux, we'll need to manually edit the pragmas again.
+ *
+ * If the BPF program does not define BPF_NO_PRESERVE_ACCESS_INDEX then all
+ * structs _except_ those defined by the ghost uapi header get CO-RE treatment.
+ * If the BPF program defines BPF_NO_PRESERVE_ACCESS_INDEX then no struct
+ * accesses get CO-RE treatment.  See the top of this file for the pragma we're
+ * popping.
  */
 
 #ifndef BPF_NO_PRESERVE_ACCESS_INDEX
@@ -32832,6 +32846,7 @@ struct ghost_sw_info {
 
 struct ghost_msg_payload_task_new {
 	uint64_t gtid;
+	uint64_t parent_gtid;
 	uint64_t runtime;
 	uint16_t runnable;
 	int nice;
@@ -32881,12 +32896,16 @@ struct ghost_msg_payload_task_priority_changed {
 	int nice;
 };
 
-struct ghost_msg_payload_task_latched {
+struct ghost_msg_payload_task_on_cpu {
 	uint64_t gtid;
 	uint64_t commit_time;
 	uint64_t cpu_seqnum;
 	int cpu;
-	char latched_preempt;
+};
+
+struct ghost_msg_payload_task_latch_failure {
+	uint64_t gtid;
+	int errno;
 };
 
 struct ghost_msg_payload_cpu_tick {
@@ -32932,7 +32951,8 @@ struct bpf_ghost_msg {
 		struct ghost_msg_payload_task_switchto switchto;
 		struct ghost_msg_payload_task_affinity_changed affinity;
 		struct ghost_msg_payload_task_priority_changed	priority;
-		struct ghost_msg_payload_task_latched latched;
+		struct ghost_msg_payload_task_on_cpu on_cpu;
+		struct ghost_msg_payload_task_latch_failure latch_failure;
 		struct ghost_msg_payload_cpu_tick cpu_tick;
 		struct ghost_msg_payload_timer timer;
 		struct ghost_msg_payload_cpu_not_idle cpu_not_idle;
@@ -32943,6 +32963,13 @@ struct bpf_ghost_msg {
 	};
 	uint16_t type;
 	uint32_t seqnum;
+
+	/*
+	 * BPF can inform the kernel which cpu it would prefer to wake up
+	 * in response to this message.
+	 * -1 indicates no preference.
+	 */
+	int pref_cpu;
 };
 
 /* GHOST: end of disabling CO-RE relocations */
@@ -33034,8 +33061,9 @@ enum {
 	MSG_TASK_DEPARTED = 70,
 	MSG_TASK_SWITCHTO = 71,
 	MSG_TASK_AFFINITY_CHANGED = 72,
-	MSG_TASK_LATCHED = 73,
+	MSG_TASK_ON_CPU = 73,
 	MSG_TASK_PRIORITY_CHANGED = 74,
+	MSG_TASK_LATCH_FAILURE = 75,
 	MSG_CPU_TICK = 128,
 	MSG_CPU_TIMER_EXPIRED = 129,
 	MSG_CPU_NOT_IDLE = 130,
@@ -33218,7 +33246,17 @@ struct bpf_ghost_sched {
 	__u8 agent_runnable;
 	__u8 might_yield;
 	__u8 dont_idle;
+	__u8 must_resched;
 	__u64 next_gtid;
+};
+
+struct bpf_ghost_select_rq {
+	__u64 gtid;
+	__u32 task_cpu;
+	__u32 waker_cpu;
+	__u32 sd_flag;
+	__u32 wake_flags;
+	__u8 skip_ttwu_queue;
 };
 
 enum bpf_func_id {
@@ -42493,6 +42531,8 @@ struct bpf_ctx_convert {
 	struct bpf_ghost_sched BPF_PROG_TYPE_GHOST_SCHED_kern;
 	struct bpf_ghost_msg BPF_PROG_TYPE_GHOST_MSG_prog;
 	struct bpf_ghost_msg BPF_PROG_TYPE_GHOST_MSG_kern;
+	struct bpf_ghost_select_rq BPF_PROG_TYPE_GHOST_SELECT_RQ_prog;
+	struct bpf_ghost_select_rq BPF_PROG_TYPE_GHOST_SELECT_RQ_kern;
 };
 
 struct bpf_flow_keys {

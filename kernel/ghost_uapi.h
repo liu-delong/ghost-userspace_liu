@@ -25,7 +25,7 @@
  * process are the same version as each other. Each successive version changes
  * values in this header file, assumptions about operations in the kernel, etc.
  */
-#define GHOST_VERSION	75
+#define GHOST_VERSION 83
 
 /*
  * Define SCHED_GHOST via the ghost uapi unless it has already been defined
@@ -246,8 +246,9 @@ enum {
 	MSG_TASK_DEPARTED,
 	MSG_TASK_SWITCHTO,
 	MSG_TASK_AFFINITY_CHANGED,
-	MSG_TASK_LATCHED,
+	MSG_TASK_ON_CPU,
 	MSG_TASK_PRIORITY_CHANGED,
+	MSG_TASK_LATCH_FAILURE,
 
 	/* cpu messages */
 	MSG_CPU_TICK		= _MSG_CPU_FIRST,
@@ -262,6 +263,7 @@ enum {
 /* TODO: Move payload to header once all clients updated. */
 struct ghost_msg_payload_task_new {
 	uint64_t gtid;
+	uint64_t parent_gtid;
 	uint64_t runtime;	/* cumulative runtime in ns */
 	uint16_t runnable;
 	int nice;		/* task priority in nice value [-20, 19] */
@@ -343,12 +345,16 @@ struct ghost_msg_payload_task_switchto {
 	int cpu;
 };
 
-struct ghost_msg_payload_task_latched {
+struct ghost_msg_payload_task_on_cpu {
 	uint64_t gtid;
 	uint64_t commit_time;
 	uint64_t cpu_seqnum;
 	int cpu;
-	char latched_preempt;
+};
+
+struct ghost_msg_payload_task_latch_failure {
+	uint64_t gtid;
+	int errno;
 };
 
 struct ghost_msg_payload_cpu_not_idle {
@@ -394,7 +400,8 @@ struct bpf_ghost_msg {
 		struct ghost_msg_payload_task_switchto	switchto;
 		struct ghost_msg_payload_task_affinity_changed	affinity;
 		struct ghost_msg_payload_task_priority_changed	priority;
-		struct ghost_msg_payload_task_latched	latched;
+		struct ghost_msg_payload_task_on_cpu	on_cpu;
+		struct ghost_msg_payload_task_latch_failure	latch_failure;
 		struct ghost_msg_payload_cpu_tick	cpu_tick;
 		struct ghost_msg_payload_timer		timer;
 		struct ghost_msg_payload_cpu_not_idle	cpu_not_idle;
@@ -405,6 +412,13 @@ struct bpf_ghost_msg {
 	};
 	uint16_t type;
 	uint32_t seqnum;
+
+	/*
+	 * BPF can inform the kernel which cpu it would prefer to wake up
+	 * in response to this message.
+	 * -1 indicates no preference.
+	 */
+	int pref_cpu;
 };
 
 #ifdef __cplusplus
@@ -476,7 +490,7 @@ enum ghost_base_ops {
 #define ELIDE_PREEMPT     (1 << 9)  /* Do not send TASK_PREEMPT if we preempt
 				     * a previous ghost task on this cpu
 				     */
-#define SEND_TASK_LATCHED (1 << 10) /* Send TASK_LATCHED at commit time */
+#define SEND_TASK_ON_CPU  (1 << 10) /* Send TASK_ON_CPU when on cpu */
 /* After the task is latched, don't immediately preempt it if the cpu local
  * agent is picked to run; wait at least until the next sched tick hits
  * (assuming the agent is still running). This provides a good tradeoff between
@@ -502,6 +516,15 @@ enum ghost_base_ops {
 
 /* Union of all COMMIT_AT_XYZ flags */
 #define COMMIT_AT_FLAGS		(COMMIT_AT_SCHEDULE | COMMIT_AT_TXN_COMMIT)
+
+/* flags accepted by bpf_ghost_resched_cpu2 */
+#define RESCHED_ANY_CLASS       (1 << 0) /* resched no matter what type of task is running */
+#define RESCHED_GHOST_CLASS     (1 << 1) /* resched if the running task is a ghost task */
+#define RESCHED_IDLE_CLASS      (1 << 2) /* resched if the running task is an idle task */
+#define RESCHED_OTHER_CLASS     (1 << 3) /* resched if the running task is neither ghost nor idle */
+#define SET_MUST_RESCHED        (1 << 4) /* set rq->ghost.must_resched as part of the resched */
+#define WAKE_AGENT              (1 << 5) /* if we resched, also force the agent to wake */
+#define GHOST_RESCHED_CPU_MAX   (1 << 6) /* Must be the last value here. */
 
 /* special 'gtid' encodings that can be passed to ghost_run() */
 #define GHOST_NULL_GTID		(0)

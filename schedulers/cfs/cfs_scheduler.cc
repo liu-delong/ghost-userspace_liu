@@ -27,7 +27,6 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "kernel/ghost_uapi.h"
 #include "lib/agent.h"
 #include "lib/logging.h"
 #include "lib/topology.h"
@@ -39,6 +38,11 @@
                   absl::ToDoubleSeconds(MonotonicNow() - start), \
                   sched_getcpu(), message);                      \
   } while (0)
+
+// TODO: Remove this flag after we test idle load balancing
+// thoroughly.
+ABSL_FLAG(bool, experimental_enable_idle_load_balancing, true,
+          "Experimental flag to enable idle load balancing.");
 
 namespace ghost {
 
@@ -57,9 +61,12 @@ CfsScheduler::CfsScheduler(Enclave* enclave, CpuList cpulist,
                            absl::Duration latency)
     : BasicDispatchScheduler(enclave, std::move(cpulist), std::move(allocator)),
       min_granularity_(min_granularity),
-      latency_(latency) {
+      latency_(latency),
+      idle_load_balancing_(
+          absl::GetFlag(FLAGS_experimental_enable_idle_load_balancing)) {
   for (const Cpu& cpu : cpus()) {
     CpuState* cs = cpu_state(cpu);
+    cs->id = cpu.id();
 
     // CfsRq has a default constructor, meaning these parameters will initially
     // be set to 0, so set them to the correct value.
@@ -243,6 +250,28 @@ Cpu CfsScheduler::SelectTaskRq(CfsTask* task) {
 
   // We couldn't find an idle cpu, so just use the least loaded one.
   return min_load_cpu;
+}
+
+void CfsScheduler::StartMigrateTask(CfsTask* task) {
+  CpuState* cs = cpu_state_of(task);
+  cs->run_queue.mu_.AssertHeld();
+
+  cs->run_queue.DequeueTask(task);
+  task->task_state.SetOnRq(CfsTaskState::OnRq::kMigrating);
+  cs->migration_queue.EnqueueTask(task);
+}
+
+void CfsScheduler::StartMigrateCurrTask() {
+  int my_cpu = MyCpu();
+  CpuState* cs = &cpu_states_[my_cpu];
+  cs->run_queue.mu_.AssertHeld();
+
+  CfsTask* task = cs->current;
+  CHECK_EQ(task->cpu, my_cpu);
+
+  cs->current = nullptr;
+  task->task_state.SetState(CfsTaskState::State::kRunnable);
+  StartMigrateTask(task);
 }
 
 bool CfsScheduler::Migrate(CfsTask* task, Cpu cpu, BarrierToken seqnum) {
@@ -460,9 +489,9 @@ void CfsScheduler::TaskYield(CfsTask* task, const Message& msg) {
   PrintDebugTaskMessage("TaskYield", cs, task);
   cs->run_queue.mu_.AssertHeld();
 
+  // Kick the task off-cpu.
   CHECK_EQ(cs->current, task);
-  // Setting to runnable will trigger a PutPrevTask.
-  task->task_state.SetState(CfsTaskState::State::kRunnable);
+  PutPrevTask();
 
   if (payload->from_switchto) {
     Cpu cpu = topology()->cpu(payload->cpu);
@@ -495,13 +524,9 @@ void CfsScheduler::TaskPreempted(CfsTask* task, const Message& msg) {
   PrintDebugTaskMessage("TaskPreempted", cs, task);
   cs->run_queue.mu_.AssertHeld();
 
-  // Skip the check in case cs->current == nullptr. TaskPreempted
-  // invoked after the task has been removed from the RQ.
-  if (cs->current) {
-    CHECK_EQ(cs->current, task);
-  }
-
-  // no-op. the task doesn't change any state.
+  // Kick the task off-cpu.
+  CHECK_EQ(cs->current, task);
+  PutPrevTask();
 
   if (payload->from_switchto) {
     Cpu cpu = topology()->cpu(payload->cpu);
@@ -538,6 +563,26 @@ void CfsScheduler::CheckPreemptTick(const Cpu& cpu)
   }
 }
 
+void CfsScheduler::PutPrevTask() {
+  CpuState* cs = &cpu_states_[MyCpu()];
+  cs->run_queue.mu_.AssertHeld();
+
+  CfsTask* task = cs->current;
+  cs->current = nullptr;
+
+  // We have a notable deviation from the upstream's behavior here. In upstream,
+  // put_prev_task does not update the state, while we update the state here.
+  task->task_state.SetState(CfsTaskState::State::kRunnable);
+
+  // Task affinity no longer allows this CPU to run the task. We should migrate
+  // this task.
+  if (!task->cpu_affinity.IsSet(task->cpu)) {
+    StartMigrateTask(task);
+  } else {  // Otherwise just add the task into this CPU's run queue.
+    cs->run_queue.PutPrevTask(task);
+  }
+}
+
 void CfsScheduler::CpuTick(const Message& msg) {
   const ghost_msg_payload_cpu_tick* payload =
       static_cast<const ghost_msg_payload_cpu_tick*>(msg.payload());
@@ -552,6 +597,122 @@ void CfsScheduler::CpuTick(const Message& msg) {
   // reach into our rb tree.
   CheckPreemptTick(cpu);
 }
+
+//-----------------------------------------------------------------------------
+// Load Balance
+//-----------------------------------------------------------------------------
+
+inline void CfsScheduler::AttachTasks(struct LoadBalanceEnv& env) {
+  absl::MutexLock l(&env.dst_cs->run_queue.mu_);
+
+  env.dst_cs->run_queue.AttachTasks(env.tasks);
+  env.imbalance -= env.tasks.size();
+}
+
+inline int CfsScheduler::DetachTasks(struct LoadBalanceEnv& env) {
+  absl::MutexLock l(&env.src_cs->run_queue.mu_);
+
+  env.src_cs->run_queue.DetachTasks(env.dst_cs, env.imbalance, env.tasks);
+
+  return env.tasks.size();
+}
+
+inline int CfsScheduler::CalculateImbalance(LoadBalanceEnv& env) {
+  // Migrate up to half the tasks src_cpu has more then dst_cpu.
+  int src_tasks = env.src_cs->run_queue.LocklessSize();
+  int dst_tasks = env.dst_cs->run_queue.LocklessSize();
+  int excess = src_tasks - dst_tasks;
+
+  env.imbalance = 0;
+  if (excess >= 2) {
+    env.imbalance = std::min(kMaxTasksToLoadBalance,
+                             static_cast<size_t>(excess / 2));
+    env.tasks.reserve(env.imbalance);
+  }
+
+  return env.imbalance;
+}
+
+inline int CfsScheduler::FindBusiestQueue() {
+  // TODO: Add more logic for better selection of busiest CPU.
+  // Upstream handles more cases, in this simplistic implementation we
+  // balance only the number of runnable tasks.
+
+  int busiest_runnable_nr = 0;
+  int busiest_cpu = 0;
+  for (const Cpu& cpu : cpus()) {
+    int src_cpu_runnable_nr = cpu_state(cpu)->run_queue.LocklessSize();
+
+    if (src_cpu_runnable_nr <= busiest_runnable_nr) continue;
+
+    busiest_runnable_nr = src_cpu_runnable_nr;
+    busiest_cpu = cpu.id();
+  }
+
+  return busiest_cpu;
+}
+
+inline bool CfsScheduler::ShouldWeBalance(LoadBalanceEnv& env) {
+  // Allow any newly idle CPU to do the newly idle load balance.
+  if (env.idle == CpuIdleType::kCpuNewlyIdle) {
+    return env.dst_cs->LocklessRqEmpty();
+  }
+
+  // Load balance runs from the first idle CPU or if there are no idle CPUs then
+  // the first CPU in the enclave.
+  int dst_cpu = cpus().Front().id();
+  for (const Cpu& cpu : cpus()) {
+    CpuState* dst_cs = cpu_state(cpu);
+    if (dst_cs->LocklessRqEmpty()) {
+      dst_cpu = cpu.id();
+      break;
+    }
+  }
+
+  return dst_cpu == MyCpu();
+}
+
+inline int CfsScheduler::LoadBalance(CpuState* cs, CpuIdleType idle_type) {
+  struct LoadBalanceEnv env;
+  int my_cpu = MyCpu();
+
+  env.idle = idle_type;
+  env.dst_cs = &cpu_states_[my_cpu];
+  if (!ShouldWeBalance(env)) {
+    return 0;
+  }
+
+  int busiest_cpu = FindBusiestQueue();
+  if (busiest_cpu == my_cpu) {
+    return 0;
+  }
+
+  env.src_cs = &cpu_states_[busiest_cpu];
+  if (!CalculateImbalance(env)) {
+    return 0;
+  }
+
+  int moved_tasks_cnt = DetachTasks(env);
+  if (moved_tasks_cnt) {
+    AttachTasks(env);
+  }
+
+  return moved_tasks_cnt;
+}
+
+inline CfsTask* CfsScheduler::NewIdleBalance(CpuState* cs) {
+  int load_balanced = LoadBalance(cs, CpuIdleType::kCpuNewlyIdle);
+  if (load_balanced <= 0) {
+    return nullptr;
+  }
+
+  absl::MutexLock lock(&cs->run_queue.mu_);
+  return cs->run_queue.PickNextTask(nullptr, allocator(), cs);
+}
+
+//-----------------------------------------------------------------------------
+// Schedule
+//-----------------------------------------------------------------------------
 
 void CfsScheduler::CfsSchedule(const Cpu& cpu, BarrierToken agent_barrier,
                                bool prio_boost) {
@@ -609,6 +770,10 @@ void CfsScheduler::CfsSchedule(const Cpu& cpu, BarrierToken agent_barrier,
   cs->run_queue.mu_.Lock();
   CfsTask* next = cs->run_queue.PickNextTask(prev, allocator(), cs);
   cs->run_queue.mu_.Unlock();
+
+  if (!next && idle_load_balancing_) {
+    next = NewIdleBalance(cs);
+  }
 
   cs->current = next;
 
@@ -704,39 +869,35 @@ void CfsScheduler::TaskAffinityChanged(CfsTask* task, const Message& msg)
   const ghost_msg_payload_task_affinity_changed* payload =
     static_cast<const ghost_msg_payload_task_affinity_changed*>(msg.payload());
 
+  // Make sure to remove the task from the current cpu.
+  CpuState* cs = cpu_state_of(task);
+  cs->run_queue.mu_.AssertHeld();
+
   CHECK_EQ(task->gtid.id(), payload->gtid);
-  CHECK_EQ(task->task_state.GetState(), CfsTaskState::State::kRunning);
 
   CpuList cpu_affinity = MachineTopology()->EmptyCpuList();
   if (GhostHelper()->SchedGetAffinity(task->gtid, cpu_affinity) != 0) {
     DPRINT_CFS(3, absl::StrFormat("[%s]: Cannot retrieve the CPU mask.",
       task->gtid.describe()));
-    cpu_affinity  = cpus();
+    cpu_affinity = cpus();
   }
 
   task->cpu_affinity = cpu_affinity;
 
   // Short-circuit if the current CPU is an eligible CPU. In this case, we do
-  // not even need to remove the task from the current CPU.
+  // not need to do anything here.
   if (task->cpu_affinity.IsSet(task->cpu)) {
     return;
   }
 
-  // Make sure to remove the task from the current cpu.
-  CpuState* cs = cpu_state_of(task);
-  cs->run_queue.mu_.AssertHeld();
-
-  // TODO: We need to support handling affinity changed messages that
-  // are runnable or blocked.
-  CHECK_EQ(cs->current, task);
-
-  // TODO: Consider moving this to TaskPreempted message handling.
-  cs->current = nullptr;
-  cs->run_queue.DequeueTask(task);
-  task->task_state.SetState(CfsTaskState::State::kRunnable);
-
-  task->task_state.SetOnRq(CfsTaskState::OnRq::kMigrating);
-  cs->migration_queue.EnqueueTask(task);
+  // The only case we consider here is if the task's state is runnable and it is
+  // in a wrong CPU's queue. If the task is currently running and kicked off-cpu
+  // by this affinity change, affinity will be honored at TaskPreempted. If the
+  // task is blocked, affinity will be honored at wake-up routine. If this task
+  // yields, its affinity will be examined at TaskYield.
+  if (task->task_state.IsRunnable() && !task->task_state.OnRqMigrating()) {
+    StartMigrateTask(task);
+  }
 }
 
 void CfsScheduler::TaskPriorityChanged(CfsTask* task, const Message& msg) {
@@ -922,6 +1083,7 @@ void CfsRq::DequeueTask(CfsTask* task) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
   DPRINT_CFS(2, absl::StrFormat("[%s]: Erasing task", task->gtid.describe()));
   if (rq_.erase(task)) {
     task->task_state.SetOnRq(CfsTaskState::OnRq::kDequeued);
+    rq_size_.store(rq_.size(), std::memory_order_relaxed);
     return;
   }
 
@@ -997,9 +1159,62 @@ absl::Duration CfsRq::MinPreemptionGranularity() {
 void CfsRq::InsertTaskIntoRq(CfsTask* task) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
   task->task_state.SetOnRq(CfsTaskState::OnRq::kQueued);
   rq_.insert(task);
+  rq_size_.store(rq_.size(), std::memory_order_relaxed);
   min_vruntime_ = (*rq_.begin())->vruntime;
   DPRINT_CFS(2, absl::StrFormat("[%s]: Inserted into run queue",
                                 task->gtid.describe()));
+}
+
+void CfsRq::AttachTasks(const std::vector<CfsTask*>& tasks)
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+  for (CfsTask* task : tasks) {
+    EnqueueTask(task);
+  }
+}
+
+int CfsRq::DetachTasks(const CpuState* dst_cs, int n,
+                       std::vector<CfsTask*>& tasks)
+    ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+  int tasks_detached = 0;
+  for (auto it = rq_.begin(); it != rq_.end();) {
+    if (rq_.size() <= 1 || tasks_detached >= n) {
+      break;
+    }
+
+    CfsTask* task = *it;
+    CHECK_NE(task, nullptr);
+    if (CanMigrateTask(task, dst_cs)) {
+      tasks.push_back(task);
+      tasks_detached++;
+
+      task->cpu = dst_cs->id;
+      task->task_state.SetOnRq(CfsTaskState::OnRq::kDequeued);
+      it = rq_.erase(it);
+      rq_size_.store(rq_.size(), std::memory_order_relaxed);
+    } else {
+      it++;
+    }
+  }
+
+  return tasks_detached;
+}
+
+bool CfsRq::CanMigrateTask(CfsTask* task, const CpuState* dst_cs) {
+  uint32_t seqnum = task->seqnum.load();
+
+  int dst_cpu = dst_cs->id;
+  const Channel* channel = dst_cs->channel.get();
+
+  if (dst_cpu >= 0 && !task->cpu_affinity.IsSet(dst_cpu)) {
+    return false;
+  }
+
+  if (channel != nullptr &&
+      !channel->AssociateTask(task->gtid, seqnum, /*status=*/nullptr)) {
+    return false;
+  }
+
+  return true;
 }
 
 std::unique_ptr<CfsScheduler> MultiThreadedCfsScheduler(

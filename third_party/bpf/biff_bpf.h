@@ -23,8 +23,6 @@
 
 /*
  * The array map of these, called `cpu_data`, can be mmapped by userspace.
- *
- * Need to track the cpu_seqnum to use bpf_ghost_resched_cpu().
  */
 struct biff_bpf_cpu_data {
 	uint64_t current;
@@ -60,6 +58,7 @@ struct biff_bpf_sw_data {
 	uint64_t ran_at;
 	uint64_t ran_until;
 	uint64_t runnable_at;
+	uint64_t parent;
 } __attribute__((aligned(8)));
 
 
