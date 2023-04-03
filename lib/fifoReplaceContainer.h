@@ -1,3 +1,5 @@
+#ifndef FIFOREPLACECONTAINER_H
+#define FIFOREPLACECONTAINER_H
 #include<mutex>
 #include<assert.h>
 #include<iostream>
@@ -12,11 +14,42 @@ enum conflict_option
 template<class T>
 class fifoReplaceContainer
 {
-    public:
-    
     private:
+    class Context
+    {
+        public:
+        T** p_array;
+        int size;
+        Context(int size)
+        {
+            p_array=new T*[size]{};
+        }
+        ~Context()
+        {
+            for(int i=0;i<size;i++)
+            {
+                delete p_array[i];
+            }
+            delete[] p_array;
+        }
+        T& operator[](int index)
+        {
+            if(p_array[index]!=nullptr)
+            {
+                return *p_array[index];
+            }
+            else
+            {
+                p_array[index]=new T;
+                return *p_array[index];
+            }
+        }
+        T*& ptr(int index)
+        {
+            return p_array[index];
+        }
+    } context;
     conflict_option opt;
-    T* context=nullptr;
     int front=-1;
     int protect=-1;
     uint32_t size;
@@ -31,11 +64,14 @@ class fifoReplaceContainer
      *  fifoReplaceContainer::BLOCK 阻塞直到插入成功
      *  fifoReplaceContainer::MALLOC_TEMP_PLACE 开辟临时区域储存插入的值，等到写入限制取消后自动插入到主存区中。
      */
-    fifoReplaceContainer(uint32_t size,conflict_option opt=NONBLOCK_RETURN)
+    fifoReplaceContainer(uint32_t size,conflict_option opt=NONBLOCK_RETURN):context(size)
     {
-        context=(T*)new char[sizeof(T)*size];
         this->opt=opt;
         this->size=size;
+    }
+    ~fifoReplaceContainer()
+    {
+        
     }
     /**
      * @brief 插入一个元素。当遇到读写冲突时，按照opt的方式进行处理。
@@ -75,7 +111,12 @@ class fifoReplaceContainer
             }
             front=next;
             lock.unlock();
-            new(&context[next]) T(args...);
+            if(context.ptr(next)!=nullptr)
+            {
+                delete context.ptr(next);
+                context.ptr(next)=nullptr;
+            }
+            context.ptr(next)=new T(args...);
             return next;
         }
         else
@@ -178,8 +219,8 @@ class fifoReplaceContainer
     }
     T& getValue(int physicIndex)
     {
-        assert(index>=0);
-        assert(index<size);
+        assert(physicIndex>=0);
+        assert(physicIndex<size);
         return context[physicIndex];
     }
     inline bool hasFull()
@@ -194,6 +235,8 @@ class fifoReplaceContainer
     }
     int BSearchEqual(int logical_begin,int logical_end,T value,function<int(T,T)> cmp=nullptr)
     {
+        int begin=logical_begin;
+        int end=logical_end;
         if(cmp==nullptr)
         {
             cmp=[](T a,T b){
@@ -240,8 +283,10 @@ class fifoReplaceContainer
         }
         return -1;
     }
-    int BSearchNotgreater(int begin,int end,T value,function<int(T,T)> cmp=nullptr)
+    int BSearchNotgreater(int logical_begin,int logical_end,T value,function<int(T,T)> cmp=nullptr)
     {
+        int begin=logical_begin;
+        int end=logical_end;
         if(cmp==nullptr)
         {
             cmp=[](T a,T b){
@@ -293,8 +338,10 @@ class fifoReplaceContainer
             return -1;
         }
     }
-    int BSearchNotSmaller(int begin,int end,T value,function<int(T,T)> cmp=nullptr)
+    int BSearchNotSmaller(int logical_begin,int logical_end,T value,function<int(T,T)> cmp=nullptr)
     {
+        int begin=logical_begin;
+        int end=logical_end;
         if(cmp==nullptr)
         {
             cmp=[](T a,T b){
@@ -347,3 +394,4 @@ class fifoReplaceContainer
     }
 
 };
+#endif
