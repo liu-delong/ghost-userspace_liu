@@ -13,6 +13,7 @@
 #include <iostream>
 
 #include "lib/ghost.h"
+#include "lib/monitor.h"
 
 namespace ghost {
 
@@ -82,6 +83,7 @@ Message LocalChannel::Peek() const {
   CHECK_EQ(overflow, 0);
 
   tidx = tail & (nelems - 1);
+  stole_message(&r->msgs[tidx]);
   return Message(&r->msgs[tidx]);
 }
 

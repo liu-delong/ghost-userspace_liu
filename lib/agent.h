@@ -30,6 +30,7 @@
 #include "lib/topology.h"
 #include "lib/trivial_status.h"
 #include "shared/shmem.h"
+#include "lib/monitor.h"
 
 namespace ghost {
 
@@ -610,8 +611,9 @@ class AgentProcess {
       }
     });
     rpc_handler.detach();
-
+    send_ok();
     sb_->agent_ready_.Notify();
+    
     sb_->kill_agent_.WaitForNotification();
 
     // Explicitly shut down the agent.  We could just exit, but this will run

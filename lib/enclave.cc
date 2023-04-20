@@ -18,6 +18,7 @@
 #include "bpf/user/agent.h"
 #include "lib/agent.h"
 #include "lib/scheduler.h"
+#include "lib/monitor.h"
 
 namespace ghost {
 
@@ -474,6 +475,7 @@ LocalEnclave::LocalEnclave(AgentConfig config)
       SetDeliverTicks(true);
   }
   CHECK_EQ(agent_bpf_init(), 0);
+  monitorInit(config.cpus_,this);
 }
 
 LocalEnclave::~LocalEnclave() {

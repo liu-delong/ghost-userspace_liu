@@ -127,6 +127,10 @@ class fifoReplaceContainer
     }
     int lockFront(int reference,int cnt)
     {
+        if(reference==-1)
+        {
+            return -1;
+        }
         assert(cnt<size);
         int begin=reference-cnt;
         int end=reference;

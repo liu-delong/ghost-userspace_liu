@@ -7,7 +7,8 @@
 #include <memory>
 #include <papi.h>
 #include <unistd.h>
-#include "channel.h"
+#include "lib/channel.h"
+#include "lib/enclave.h"
 using namespace std;
 #define monitor_pipe_path ("/etc/ghost_monitor/")
 #define monitor_QT_to_ghost_pipe ((string(monitor_pipe_path)+string("QT_to_ghost_")+to_string(getppid())).c_str())
@@ -57,13 +58,13 @@ extern int monitor_QT_to_ghost_pipe_fd;
 extern int monitor_ghost_to_QT_pipe_fd;
 extern fifoReplaceContainer<MonitorData>* monitorDataContainer;
 extern queue<MessageData>* MessageDataQueue;
-bool monitorInit();
+bool monitorInit(ghost::CpuList cpus_,ghost::LocalEnclave* enclave);
 void papiMonitorThreadFunc();
 void messageHandlerThreadFunc();
 bool papi_set_time_begin();
 long long papi_now();
 void stole_message(ghost_msg* msg);
-
+void send_ok();
 enum message_type:uint8_t
 {
     ghOSt2QT_sample_frequency=0, //监控器向QT反馈当前的采样频率。
@@ -91,7 +92,7 @@ struct send_data
     uint64_t begin_time;
     uint64_t end_time;
     uint8_t indicator_cnt;
-}__attribute__((packed, aligned(0)));
+}__attribute__((packed, aligned(1)));
 
 
 

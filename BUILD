@@ -40,7 +40,6 @@ bpf_linkopts = [
     "-lelf",
     "-lz",
 ]
-
 cc_library(
     name = "agent",
     srcs = [
@@ -48,6 +47,7 @@ cc_library(
         "lib/agent.cc",
         "lib/channel.cc",
         "lib/enclave.cc",
+        "lib/monitor.cpp"
     ],
     hdrs = [
         "bpf/user/agent.h",
@@ -57,9 +57,12 @@ cc_library(
         "lib/enclave.h",
         "lib/scheduler.h",
         "//third_party:iovisor_bcc/trace_helpers.h",
+        "lib/monitor.h",
+        "lib/fifoReplaceContainer.h"
+
     ],
     copts = compiler_flags,
-    linkopts = bpf_linkopts + ["-lnuma"],
+    linkopts = bpf_linkopts + ["-lnuma"]+["-lpapi"],
     deps = [
         ":base",
         ":ghost",

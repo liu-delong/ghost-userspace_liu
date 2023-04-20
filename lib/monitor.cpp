@@ -1,4 +1,3 @@
-#include"monitor.h"
 #include<sys/stat.h> //for mkfifo
 #include <fcntl.h>  //for open
 #include <unistd.h> //for read write
@@ -8,11 +7,16 @@
 #include <unordered_map>
 #include <papi.h>
 #include <mutex>
-#include "ghost_uapi.h"
-#include "base.h"
-#include "channel.h"
 #include <cstring>
-#include<thread>
+#include <thread>
+#include "lib/monitor.h"
+#include <sys/poll.h>
+#include "kernel/ghost_uapi.h"
+#include "lib/base.h"
+#include "lib/channel.h"
+#include "monitor.h"
+#include "lib/enclave.h"
+
 #define LDEBUG
 #ifdef LDEBUG
 #define ldebug(debug_string) cout<<__FILE__<<":"<<__LINE__<<" "<<"LDEBUG:"<<debug_string<<endl;
@@ -28,6 +32,7 @@ using namespace std::chrono;
 void monitorExit();
 
 static bool monitorHasInit=false;
+static bool hasSendOK=false;
 
 int monitor_QT_to_ghost_pipe_fd=-1;
 int monitor_ghost_to_QT_pipe_fd=-1;
@@ -84,12 +89,12 @@ void stole_message(ghost_msg* msg)
     {
         return;
     }
-    static bool time_begin=0;
-    if(!time_begin&&msg->type==MSG_TASK_NEW)
-    {
-        time_begin=1;
-        papi_set_time_begin();
-    }
+    // static bool time_begin=0;
+    // if(!time_begin&&msg->type==MSG_TASK_NEW)
+    // {
+    //     time_begin=1;
+    //     papi_set_time_begin();
+    // }
     auto time=papi_now();
     auto payload=shared_ptr<char>(new char[msg->length-sizeof(ghost_msg)]);
     memcpy(payload.get(),(void*)(msg->payload),msg->length-sizeof(ghost_msg));
@@ -97,6 +102,8 @@ void stole_message(ghost_msg* msg)
     MessageDataQueue->emplace(time,msg->type,payload);
     MDQ_lock.unlock();
 }
+
+
 bool fileExist(string filename)
 {
     struct stat buffer;   
@@ -175,14 +182,14 @@ void monitorExit()
         close(monitor_QT_to_ghost_pipe_fd);
         monitor_QT_to_ghost_pipe_fd=-1;
     }
-    if(fileExist(monitor_ghost_to_QT_pipe))
-    {
-        remove(monitor_ghost_to_QT_pipe);
-    }
-    if(fileExist(monitor_QT_to_ghost_pipe))
-    {
-        remove(monitor_QT_to_ghost_pipe);
-    }
+    // if(fileExist(monitor_ghost_to_QT_pipe))
+    // {
+    //     remove(monitor_ghost_to_QT_pipe);
+    // }
+    // if(fileExist(monitor_QT_to_ghost_pipe))
+    // {
+    //     remove(monitor_QT_to_ghost_pipe);
+    // }
     if(papi_has_init)
     {
         auto buf=new long long[indicator_nums.size()];
@@ -190,17 +197,20 @@ void monitorExit()
         PAPI_cleanup_eventset(papi_eventset);
         PAPI_destroy_eventset(&papi_eventset);
         papi_has_init=false;
+        delete buf;
     }
     monitorHasInit=false;
 }
 bool InitPipe()
 {
+    
     if(!fileExist(monitor_ghost_to_QT_pipe)||!fileExist(monitor_QT_to_ghost_pipe))
     {
         ldebug("pipe file don't exist!")
         monitorExit();
         return false;
     }
+
     monitor_QT_to_ghost_pipe_fd=open(monitor_QT_to_ghost_pipe,O_RDONLY|O_NONBLOCK);
     if(monitor_QT_to_ghost_pipe_fd==-1)
     {
@@ -208,7 +218,6 @@ bool InitPipe()
         monitorExit();
         return false;
     }
-    usleep(10000);
     monitor_ghost_to_QT_pipe_fd=open(monitor_ghost_to_QT_pipe,O_WRONLY|O_NONBLOCK);
     if(monitor_ghost_to_QT_pipe_fd==-1)
     {
@@ -216,8 +225,32 @@ bool InitPipe()
         monitorExit();
         return false;
     }
+    int retv=write(monitor_ghost_to_QT_pipe_fd,"1",1);
+    if(retv){}
+    struct pollfd rfds;
+    rfds.fd = monitor_QT_to_ghost_pipe_fd;
+    rfds.events = POLLIN;
+    int ret = poll(&rfds, 1, 20000);
+    if (ret == -1)
+    {
+        ldebug("can't set poll!")
+        monitorExit();
+        return false;
+    }
+    else if (ret == 0)
+    {
+        ldebug("wait for qt response overtime!")
+        monitorExit();
+        return false;
+    }
+    else
+    {
+        char buf[1];
+        int ret=read(monitor_QT_to_ghost_pipe_fd,buf,1);
+        if(ret){}
+    }
     signal(SIGPIPE,SIG_IGN); //忽略读端关闭的信息，因为这个信号会导致进程退出。这个信号在读端关闭后，写端调用write函数时发出。
-    usleep(1000);
+    //usleep(1000);
     ldebug("InitPipe_ok")
     return true;
 }
@@ -271,28 +304,59 @@ bool ReceiveIndicator()
     ldebug("ReceiveIndicator_ok")
     return true;
 }
-bool monitorInit()
+bool monitorInit(ghost::CpuList cpus_,ghost::LocalEnclave* enclave)
 {
     thread_local process_thread_killer killer;
     if(monitorHasInit) return true;
+    ldebug("ghost monitor initing!")
     if(InitPipe()&&ReceiveHelloFromQT()&&ReceiveIndicator()) 
     {
+        auto cpus=cpus_.ToIntVector();
+        int n=cpus.size();
+        auto buf=new int[n];
+        for(int i=0;i<n;i++)
+        {
+            buf[i]=cpus[i];
+        }
+        write_QT((char*)&n,4);
+        write_QT((char*)buf,4*n);
+        auto folder=new char[300];
+        auto pid =getpid();
+        auto folder_fd=enclave->GetDirFd();
+        auto name=(string("/proc/"+to_string(pid)+"/fd/"+to_string(folder_fd)));
+        int len=readlink(name.c_str(),folder,299);
+        if(len!=-1)
+        {
+            folder[len]=0;
+            write_QT((char*)&len,4);
+            write_QT(folder,len);
+        }
+        else
+        {
+            cout<<"can't not find the enclave_folder"<<endl;
+            int tempn=5;
+            write_QT((char*)&tempn,4);
+            write_QT("error",5);
+        }
         monitorDataContainer=new fifoReplaceContainer<MonitorData>(40000);
         MessageDataQueue=new queue<MessageData>;
         monitorHasInit=true;
         PAPI_thread=thread(papiMonitorThreadFunc);
-        sleep(1);
+        //sleep(1);
         Message_thread=thread(messageHandlerThreadFunc);
+        ldebug("ghost monitor init ok!")
         return true;
     }
     else
     {
+        ldebug("ghost monitor init fail!")
         monitorExit();
         return false;
     }
 }
 bool InitPapi()
 {
+    
     if(PAPI_library_init(PAPI_VER_CURRENT)!=PAPI_VER_CURRENT)
     {
         ldebug("papi_init_failed!")
@@ -315,10 +379,13 @@ bool InitPapi()
             return false;
         }
     }
-    if(PAPI_start(papi_eventset)!=PAPI_OK)
+    if(indicator_nums.size()>0)
     {
-        ldebug("start papi failed!")
-        return false;
+        if(PAPI_start(papi_eventset)!=PAPI_OK)
+        {
+            ldebug("start papi failed!")
+            return false;
+        }
     }
     papi_set_time_begin();
     papi_has_init=true;
@@ -329,9 +396,28 @@ bool papi_set_time_begin()
     papi_time_begin_num=PAPI_get_real_nsec();
     return true;
 }
+void send_ok()
+{
+    if(monitorHasInit)
+    {
+        if(write_QT("ok",2)==2)
+        {
+            hasSendOK=true;
+        }
+        else
+        {
+            monitorExit();
+        }
+        
+    }
+}
 void papiMonitorThreadFunc()
 {
     send_data buf{};
+    while(!hasSendOK)
+    {
+        usleep(0);
+    }
     if(InitPapi())
     {
         less_delay=get_less_delay();
@@ -350,7 +436,7 @@ void papiMonitorThreadFunc()
     
     while(1)
     {
-        if(!monitorHasInit)
+        if(!monitorHasInit||indicator_nums.size()==0)
         {
             return;
         }
@@ -372,18 +458,16 @@ void papiMonitorThreadFunc()
 static void deal_message(MessageData &message)
 {
     static unordered_map<pid_t,uint64_t> runtime_map;
-    Gtid gtid;
+    ghost::Gtid gtid;
     int cpu;
     uint64_t runtime;
-    pid_t tid;
-    pid_t tgid;
     task_message_type t;
     switch (message.type)
     {
         case MSG_TASK_NEW:
         {
             auto payload=(ghost_msg_payload_task_new*)message.payload.get();
-            auto gtid=Gtid(payload->gtid);
+            auto gtid=ghost::Gtid(payload->gtid);
             auto tid=gtid.tid();
             auto tgid=gtid.tgid();
             auto runtime=payload->runtime;
@@ -396,7 +480,7 @@ static void deal_message(MessageData &message)
         case MSG_TASK_PREEMPT:
         {
             auto payload=(ghost_msg_payload_task_preempt*)message.payload.get();
-            gtid=Gtid(payload->gtid);
+            gtid=ghost::Gtid(payload->gtid);
             cpu=payload->cpu;
             runtime=payload->runtime;
             t=task_preemt;
@@ -405,7 +489,7 @@ static void deal_message(MessageData &message)
         case MSG_TASK_YIELD:
         {
             auto payload=(ghost_msg_payload_task_yield*)message.payload.get();
-            gtid=Gtid(payload->gtid);
+            gtid=ghost::Gtid(payload->gtid);
             cpu=payload->cpu;
             runtime=payload->runtime;
             t=task_yield;
@@ -414,7 +498,7 @@ static void deal_message(MessageData &message)
         case MSG_TASK_BLOCKED:
         {
             auto payload=(ghost_msg_payload_task_blocked*)message.payload.get();
-            gtid=Gtid(payload->gtid);
+            gtid=ghost::Gtid(payload->gtid);
             cpu=payload->cpu;
             runtime=payload->runtime;
             t=task_blocked;
@@ -423,7 +507,7 @@ static void deal_message(MessageData &message)
         case MSG_TASK_DEAD:
         {
             auto payload=(ghost_msg_payload_task_dead*)message.payload.get();
-            auto gtid=Gtid(payload->gtid);
+            auto gtid=ghost::Gtid(payload->gtid);
             auto tid=gtid.tid();
             auto tgid=gtid.tgid();
             send_data buf={ghOSt2QT_task_message,task_dead,-1,tid,tgid,runtime_map[tid],message.time,0};
@@ -434,7 +518,7 @@ static void deal_message(MessageData &message)
         case MSG_TASK_DEPARTED:
         {
             auto payload=(ghost_msg_payload_task_departed*)message.payload.get();
-            auto gtid=Gtid(payload->gtid);
+            auto gtid=ghost::Gtid(payload->gtid);
             auto tid=gtid.tid();
             auto tgid=gtid.tgid();
             auto cpu=payload->cpu;
@@ -459,6 +543,12 @@ static void deal_message(MessageData &message)
         decltype(end_time) begin_time=end_time-on_cpu_time;
         
         int front=monitorDataContainer->getfront();
+        if(front<0)  //此时papi没有数据。
+        {
+            send_data buf={ghOSt2QT_task_message,t,cpu,tid,tgid,begin_time,end_time,0};
+            write_QT((char*)&buf,sizeof(send_data));
+            return;
+        }
         int cnt=0;
         for(int i=1;true;i++)
         {
@@ -469,7 +559,7 @@ static void deal_message(MessageData &message)
             }
         }
         int index=monitorDataContainer->BSearchNotgreater(front-cnt,front,begin_time);
-        if(index>=0)
+        if(index>=0)  //此时，找到了距离本次任务开始执行时间最近的采样记录。
         {
             auto begin_data=monitorDataContainer->getValue(index);
             index=monitorDataContainer->BSearchNotSmaller(front-cnt,front,end_time);
@@ -492,9 +582,9 @@ static void deal_message(MessageData &message)
                 write_QT((char*)&buf,sizeof(send_data));
             }
         }
-        else
+        else  //没有找到采样记录。
         {
-            send_data buf={ghOSt2QT_task_message,task_preemt,cpu,tid,tgid,begin_time,end_time,0};
+            send_data buf={ghOSt2QT_task_message,t,cpu,tid,tgid,begin_time,end_time,0};
             write_QT((char*)&buf,sizeof(send_data));
         }
         monitorDataContainer->clearProtect();
@@ -502,6 +592,10 @@ static void deal_message(MessageData &message)
 }
 void messageHandlerThreadFunc()
 {
+    while(!hasSendOK)
+    {
+        usleep(0);
+    }
     unordered_map<pid_t,uint64_t> runtime_map;
     while(monitorHasInit)
     {
