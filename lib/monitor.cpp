@@ -578,14 +578,27 @@ static void deal_message(MessageData &message)
             }
             else
             {
-                send_data buf={ghOSt2QT_task_message,t,cpu,tid,tgid,begin_time,end_time,0};
+                send_data buf={ghOSt2QT_task_message,t,cpu,tid,tgid,begin_time,end_time,(uint8_t)indicator_cnt};
                 write_QT((char*)&buf,sizeof(send_data));
+                unique_ptr<long long> d(new long long[indicator_cnt]);
+                for(int i=0;i<indicator_cnt;i++)
+                {
+                    d.get()[i]=0;
+                }
+                write_QT((char*)d.get(),sizeof(long long)*indicator_cnt);
             }
         }
         else  //没有找到采样记录。
         {
-            send_data buf={ghOSt2QT_task_message,t,cpu,tid,tgid,begin_time,end_time,0};
+            send_data buf={ghOSt2QT_task_message,t,cpu,tid,tgid,begin_time,end_time,(uint8_t)indicator_cnt};
+
             write_QT((char*)&buf,sizeof(send_data));
+            unique_ptr<long long> d(new long long[indicator_cnt]);
+            for(int i=0;i<indicator_cnt;i++)
+            {
+                d.get()[i]=0;
+            }
+            write_QT((char*)d.get(),sizeof(long long)*indicator_cnt);
         }
         monitorDataContainer->clearProtect();
     }
